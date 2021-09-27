@@ -1,0 +1,6 @@
+*.html
+*.Rproj
+*.gz
+scrna*
+*.png
+.Rproj.user

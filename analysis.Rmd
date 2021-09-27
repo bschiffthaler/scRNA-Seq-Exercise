@@ -1,0 +1,383 @@
+---
+output: html_document
+runtime: shiny
+---
+
+# scRNA Seq
+
+## Data
+
+Originally, this data is from 10X genomics. Here is a short description:
+
+>Peripheral blood mononuclear cells (PBMCs) from a healthy donor (same donor as pbmc8k). PBMCs are primary cells with relatively small amounts of RNA (~1pg RNA/cell).
+    4,340 cells detected
+    Sequenced on Illumina Hiseq4000 with approximately 87,000 reads per cell
+    26bp read1 (16bp Chromium barcode and 10bp UMI), 98bp read2 (transcript), and 8bp I7 sample barcode
+    Analysis run with --expect-cells=5000
+
+We analyze one lane against the GENCODE release 38 using the following `salmon`
+command:
+
+```{bash alevin, eval = FALSE}
+salmon alevin \
+  -lISR \
+  --chromium \
+  -1 fastqs/pbmc4k_S1_L001_R1_001.fastq.gz \
+  -2 fastqs/pbmc4k_S1_L001_R2_001.fastq.gz \
+  -o L001 \
+  -p 32 \
+  --tgMap reference/txp2gene.tsv \
+  --index reference/index \
+  --dumpFeatures
+```
+
+We can now start in R with the numerous packages we'll need
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(AnnotationDbi)
+  library(tximeta)
+  library(SingleCellExperiment)
+  library(see)
+  library(here)
+  library(scater)
+  library(alevinQC)
+  library(tidyverse)
+  library(scran)
+  library(edgeR)
+  library(PCAtools)
+  library(DropletUtils)
+  library(org.Hs.eg.db)
+  library(bluster)
+  library(pheatmap)
+  library(celldex)
+  library(SingleR)
+})
+```
+
+The dataset it stored externally since Git isn't really meant to store large files
+so we'll need to download and extract it
+
+```{r download}
+if (! file.exists(here("scrna_10x.tar.gz"))) {
+  data_remote <- file.path(
+    "https://bschiffthaler.s3.eu-west-1.amazonaws.com",
+    "scRNA-Seq-Exercise-Data", "scrna_10x.tar.gz"
+  )
+  # Allow up to 15 minutes for download
+  options(timeout = max(900, getOption("timeout")))
+  download.file(data_remote, here("scrna_10x.tar.gz"))
+}
+if (! file.exists(here("scrna_10x"))) {
+  untar(here("scrna_10x.tar.gz"))
+}
+```
+
+Next we configure a plotting theme
+
+```{r plot_setup}
+theme_set(theme_minimal(base_size = 18))
+```
+
+Now we can perform some basic QC of the alevin run
+
+```{r alevin_qc}
+alevinQCShiny(here("scrna_10x/L001"), "L001")
+```
+
+Once that is done we can use `tximport` to import the data into R. We can also
+at this point convert the identifierts to gene symbols.
+
+```{r import}
+fasta <- file.path(
+  "http://ftp.ebi.ac.uk", "pub", "databases", "gencode",
+  "Gencode_human", "release_38", "gencode.v38.pc_transcripts.fa.gz"
+)
+gtf <- file.path(
+  "http://ftp.ebi.ac.uk", "pub", "databases", "gencode",
+  "Gencode_human", "release_38",
+  "gencode.v38.primary_assembly.annotation.gtf.gz"
+)
+makeLinkedTxome(indexDir=here("scrna_10x/reference/index/"),
+                source="GENCODE",
+                organism="Homo Sapiens",
+                release="38",
+                genome="GRCh38",
+                fasta=fasta,
+                gtf=gtf,
+                write=FALSE)
+
+sc <- tximeta(here("scrna_10x/L001/alevin/quants_mat.gz"), "alevin",
+              alevinArgs=list(filterBarcodes=TRUE))
+map <- AnnotationDbi::select(org.Hs.eg.db, str_replace(rownames(sc), ".\\d+$", ""), "SYMBOL", "ENSEMBL")
+transl <- map$SYMBOL[match(str_replace(rownames(sc), ".\\d+$", ""), map$ENSEMBL)]
+rownames(sc) <- transl
+sc <- sc[!is.na(rownames(sc)), ]
+```
+
+Next we mark mitochondrial gene expression and convert the summarized experiment
+to a `SingleCellExperiment` object.
+
+```{r convert_to_sce}
+mito <- seqnames(rowRanges(sc)) == "chrM"
+sc_m <- sc[mito, ]
+sce <- as(sc, "SingleCellExperiment")
+altExp(sce, "mito") <- sc_m
+```
+
+This is a placeholder
+
+```{r}
+TRUE
+```
+
+Now, we plot the distribution of cell counts in total and for out mito subset
+
+```{r cell_qc}
+sce <- addPerCellQC(sce)
+
+colData(sce) %>%
+  as_tibble() %>%
+  dplyr::select(ends_with("sum")) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = name, y = value + 1, fill = name)) +
+  geom_violindot(alpha = 0.5) +
+  scale_y_log10() +
+  xlab("Subset") +
+  ylab("log10(Count + 1)") +
+  theme(legend.position = "none")
+```
+
+We want to remove outliers, so we use the QC functionality from `scuttle` to
+mark cells that deviate by a lot
+
+```{r remove_outliers}
+to_remove <- quickPerCellQC(sce, sub.fields = TRUE)
+colSums(as.data.frame(to_remove))
+
+colData(sce) <- cbind(colData(sce), to_remove)
+plotColData(sce, "sum", colour_by = "discard") +
+  scale_y_log10() +
+  ggtitle("Total Counts")
+plotColData(sce, "detected", colour_by = "discard") +
+  scale_y_log10() +
+  ggtitle("Detected Genes")
+plotColData(sce, "altexps_mito_percent", colour_by = "discard") +
+  scale_y_log10() +
+  ggtitle("Percent Mito")
+
+# Check for metabolically active cells
+plotColData(sce, x = "sum", y = "altexps_mito_percent", colour_by = "discard")
+```
+
+We want to make sure that we are not removing any cells due to biological variation
+so at this point we can plot the average log fold change of cells that are dropped
+compared to those that are kept
+
+```{r verify}
+lost <- calculateAverage(counts(sce)[, !to_remove$discard])
+kept <- calculateAverage(counts(sce)[, to_remove$discard])
+
+logged <- cpm(cbind(lost, kept), log = TRUE, prior.count = 2)
+logFC <- logged[,1] - logged[,2]
+abundance <- rowMeans(logged)
+
+is_mito <- which(seqnames(rowRanges(sce)) == "chrM")
+plot(abundance, logFC, xlab = "Average count", ylab = "Log-FC (lost/kept)", pch=16)
+points(abundance[is_mito], logFC[is_mito], col = "dodgerblue", pch=16)
+abline(h = 0, col = "red")
+```
+
+There is a definite trend so if we want to be safe we can opt only to mark
+the "bad" cells instead of removing, however this will make downstream analysis
+harder so for this tutorial we will choose the riskier option
+
+```{r}
+sce <- sce[, !sce$discard]
+```
+
+We can now normalize the data. Often it is enough to do a quick and dirty normalization
+by size factors:
+
+```{r}
+library_sf <- librarySizeFactors(sce)
+summary(library_sf)
+hist(log10(library_sf), xlab="Log10[Size factor]", col='grey80')
+```
+
+However, if we want to be more thorough, we can perform ad-hoc clustering and
+use deconvolution based norms:
+
+```{r}
+clust <- quickCluster(sce) 
+table(clust)
+deconv_sf <- calculateSumFactors(sce, cluster=clust)
+summary(deconv_sf)
+
+plot(library_sf, deconv_sf, xlab="Library size factor",
+    ylab="Deconvolution size factor", log='xy', pch=16)
+abline(a=0, b=1, col="red")
+```
+
+The trend line does point to a marked difference of the latter method, so we will
+choose the safe option. We can apply the norm as follows:
+
+```{r apply_norm}
+sce <- computeSumFactors(sce, cluster=clust, min.mean=0.1)
+sce <- logNormCounts(sce)
+```
+
+In order to select interesting genes, we need to model the technical noise. We
+can then select genes that vary between cells with the trend not being explained
+by noise:
+
+```{r int_mvr}
+dec <- modelGeneVar(sce)
+fit <- metadata(dec)
+
+hvgs_var <- getTopHVGs(dec, fdr.threshold = 0.05)
+
+plot(fit$mean, fit$var, xlab="Mean of log-expression",
+    ylab="Variance of log-expression")
+points(fit$mean[hvgs_var], fit$var[hvgs_var], col = "red", )
+curve(fit$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+```
+
+Another option is to utilize the biological coefficient of variation:
+
+```{r int_cv2}
+cv2 <- modelGeneCV2(sce)
+fit2 <- metadata(cv2)
+
+hvgs_cv2 <- getTopHVGs(cv2, var.field = "ratio", fdr.threshold = 0.05)
+
+plot(fit2$mean, fit2$cv2, log="xy", xlab="Mean of log expression",
+     ylab="log coefficient of variation ^ 2",
+     xlim = c(1e-05, 1e2))
+points(fit2$mean[hvgs_cv2], fit2$cv2[hvgs_cv2], col = "red")
+curve(fit2$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+```
+
+The intersect between the methods is very high, with the latter being mostly
+a superset of the former
+
+```{r}
+c(length(hvgs_var), length(hvgs_cv2), length(intersect(hvgs_var, hvgs_cv2)))
+```
+
+For dimensionality reduction we choose a more generous set of interesting genes
+and select the top 2000:
+
+```{r pca}
+rowSubset(sce, "hvg_var") <- getTopHVGs(dec, n = 2000)
+sce <- runPCA(sce, subset_row = rowSubset(sce, "hvg_var"))
+percent_var <- attr(reducedDim(sce), "percentVar")
+```
+
+We also want to find the most informative number of components, for which we
+can select the "elbow" of the explained variation
+
+```{r n_comp}
+elbow <- PCAtools::findElbowPoint(percent_var)
+plot(percent_var, log="y", xlab="PC", ylab="Variance explained (%)")
+abline(v = elbow, col = "red")
+
+reducedDim(sce, "PCA_elbow") <- reducedDim(sce)[,1:elbow]
+plotReducedDim(sce, dimred="PCA", ncomponents = elbow)
+```
+
+Non linear methods can provide artful renders of the data, but it is important
+to remember that these methods do not preserve local or global distance:
+
+```{r}
+sce <- runUMAP(sce, dimred="PCA")
+plotReducedDim(sce, dimred="UMAP")
+
+sce <- runTSNE(sce, dimred="PCA")
+plotReducedDim(sce, dimred="TSNE")
+```
+
+Next we want to assign labels to clusters of cells. Graph based clustering 
+is effective. We can make use of e.g. the walktrap method
+
+```{r c_walktrap}
+g <- buildSNNGraph(sce, k=10, use.dimred = 'PCA')
+clust <- igraph::cluster_walktrap(g)$membership
+colLabels(sce) <- factor(clust)
+plotReducedDim(sce, "TSNE", colour_by="label")
+plotReducedDim(sce, "UMAP", colour_by="label")
+plotReducedDim(sce, "PCA", colour_by="label")
+```
+
+Other methods, such as infomap have also been used effectively. Choose based on
+visual confirmation
+
+```{r c_infomap}
+clust <- igraph::cluster_infomap(g)$membership
+colLabels(sce) <- factor(clust)
+plotReducedDim(sce, "TSNE", colour_by="label")
+plotReducedDim(sce, "UMAP", colour_by="label")
+plotReducedDim(sce, "PCA", colour_by="label")
+```
+
+We can stick with infomap, even though we might be over-splitting. Let's visualize
+the relationships between clusters:
+
+```{r}
+ratio <- pairwiseModularity(g, clust, as.ratio=TRUE)
+pheatmap(log2(ratio+1), cluster_rows=FALSE, cluster_cols=FALSE,
+    color=colorRampPalette(c("white", "blue"))(100))
+
+cluster_gr <- igraph::graph_from_adjacency_matrix(log2(ratio+1), 
+    mode="upper", weighted=TRUE, diag=FALSE)
+plot(cluster_gr, edge.width=igraph::E(cluster.gr)$weight*5,
+    layout=igraph::layout_with_lgl)
+```
+
+We next want to detect marker genes for each cluster. The default test is a 
+pairwise t-test between all clusters
+
+```{r}
+markers_t <- findMarkers(sce, pval.type="all", direction="up")
+pheatmap(getMarkerEffects(markers_t[[7]][1:10, ]))
+```
+
+In addition we can choose wilcoxon or binomial tests which have other desirable
+properties
+
+```{r}
+markers_w <- findMarkers(sce, test="wilcox", pval.type="all", direction="up")
+pheatmap(getMarkerEffects(markers_w[[7]][1:10, ], prefix = "AUC"))
+
+markers_b <- findMarkers(sce, test="binom", pval.type="all", direction="up")
+pheatmap(getMarkerEffects(markers_b[[7]][1:10, ]))
+```
+
+We can also combine multiple tests into a final rank
+
+```{r}
+combined <- multiMarkerStats(
+    t=markers_t,
+    wilcox=markers_w,
+    binom=markers_b
+)
+```
+
+Let's now check the five most predictive genes for cluster 7
+
+```{r}
+top5 <- rownames(combined[[7]][1:5, ])
+plotExpression(sce, x="label", features=top5)
+```
+
+Finally, let's use reference data to assign cell type labels to our data
+
+```{r}
+ref <- BlueprintEncodeData()
+pred <- SingleR(test=sce, ref=ref, labels=ref$label.main)
+table(pred$labels)
+plotScoreHeatmap(pred)
+
+sce$label <- pred$labels
+plotReducedDim(sce, "TSNE", colour_by = "label")
+```
