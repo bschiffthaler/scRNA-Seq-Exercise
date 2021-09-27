@@ -128,7 +128,8 @@ altExp(sce, "mito") <- sc_m
 This is a placeholder
 
 ```{r}
-TRUE
+library(DropletUtils)
+
 ```
 
 Now, we plot the distribution of cell counts in total and for out mito subset
